@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+state=/run/macbook-fan-profile/requested
+[ -r "$state" ] || exit 0
+case "$(cat "$state")" in
+    smooth|smooth-plus|early) systemctl --no-block start macbook-fan-early.service ;;
+esac

@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")"
+[ "$(id -u)" -ne 0 ] || { echo 'Run install as your desktop user.' >&2; exit 1; }
+sudo apt-get install -y python3-gi gir1.2-dbusmenu-glib-0.4
+share="$HOME/.local/share"
+units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+uuid=macbook-thermals@ubuntu-thermals.local
+for name in monitor.py monitors.py tray.py thermometer.png; do
+    install -Dm0644 "app/$name" "$share/macbook-thermals-wayland/$name"
+done
+for asset in extension/*; do install -Dm0644 "$asset" "$share/gnome-shell/extensions/$uuid/${asset##*/}"; done
+install -Dm0644 app/macbook-thermals.service "$units/macbook-thermals.service"
+install -Dm0644 app/thermometer.png "$share/icons/hicolor/48x48/apps/ubuntu-thermals.png"
+install -Dm0644 app/io.local.MacBookThermals.desktop "$share/applications/io.local.MacBookThermals.desktop"
+if [ "$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)" = 'MacBookPro15,4' ]; then
+    sudo /usr/bin/python3 -I hardware/manage.py install
+fi
+systemctl --user daemon-reload
+systemctl --user enable macbook-thermals.service
+# Enable the extension in settings even when Shell has not indexed it until next login.
+/usr/bin/python3 - "$uuid" <<'PY'
+from gi.repository import Gio
+import sys
+shell = Gio.Settings.new('org.gnome.shell')
+uuid = sys.argv[1]
+for key, add in [('disabled-extensions', False), ('enabled-extensions', True)]:
+    values = shell.get_strv(key)
+    if add and uuid not in values:
+        shell.set_strv(key, [*values, uuid])
+    elif not add and uuid in values:
+        shell.set_strv(key, [item for item in values if item != uuid])
+PY
+systemctl --user restart macbook-thermals.service
+printf '%s\n' 'MacBook Thermals is installed. Sign in again to load the panel extension.'

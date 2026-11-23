@@ -1,0 +1,126 @@
+#!/usr/bin/python3 -I
+"""Select reversible Intel package power limits on MacBookPro15,4."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+
+RAPL = Path('/sys/class/powercap/intel-rapl:0')
+STATE = Path('/run/macbook-power-presets')
+STOCK = Path('/run/macbook-stock-power.json')
+SELECTION = Path('/run/macbook-selected-power.json')
+FAN_STATE = Path('/run/macbook-fan-profile')
+FAN_MODES = {'fan-auto':None, 'fan-smooth':'smooth', 'fan-smooth-plus':'smooth-plus', 'fan-early':'early'}
+INSTALLED = '/usr/local/bin/macbook-power'
+PRESETS = {'cool': (14, 18), 'mild': (16, 20), 'everyday': (18, 22), 'fast': (22, 26)}
+LIMITS = [RAPL / f'constraint_{index}_power_limit_uw' for index in (0, 1)]
+
+
+def read_limits():
+    return [int(path.read_text()) for path in LIMITS]
+
+
+def write_limits(limits):
+    # Raise the short limit first on an increase; lower the long one first on a decrease.
+    order = (1, 0) if limits[1] > int(LIMITS[1].read_text()) else (0, 1)
+    for index in order:
+        if int(LIMITS[index].read_text()) != limits[index]:
+            LIMITS[index].write_text(f'{limits[index]}\n')
+    if read_limits() != limits:
+        raise RuntimeError('The power controller did not confirm the requested limits.')
+
+
+def publish_record(path, value):
+    pending = path.with_suffix('.tmp')
+    pending.write_text(json.dumps(value))
+    pending.chmod(0o644)
+    pending.replace(path)
+
+
+def select_fan(mode):
+    unit = 'macbook-fan-early.service'
+    with Path('/run/macbook-fan-selection.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        FAN_STATE.mkdir(mode=0o755, exist_ok=True)
+        request = FAN_STATE/'requested'
+        if mode is None:
+            subprocess.run(['/usr/bin/systemctl','stop',unit],check=True)
+            subprocess.run(['/usr/local/libexec/macbook-thermal-fan','release'],check=True)
+            if Path('/sys/module/macsmc_hwmon/parameters/fan_control').read_text().strip() != 'N':
+                raise SystemExit('Fan control belongs to another program.')
+            request.unlink(missing_ok=True)
+            return
+        if (FAN_STATE/mode).exists() and subprocess.run(
+                ['/usr/bin/systemctl','is-active','--quiet',unit]).returncode == 0:
+            return
+        pending = FAN_STATE/'requested.tmp'
+        pending.write_text(mode)
+        pending.replace(request)
+        # Stop/release the old mode before the new controller owns the fan.
+        subprocess.run(['/usr/bin/systemctl','restart',unit],check=True)
+
+
+def select(choice):
+    STATE.mkdir(mode=0o700, exist_ok=True)
+    with (STATE / 'lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        saved = STATE / 'original.json'
+        current = read_limits()
+        if not saved.exists():
+            if choice == 'restore':
+                if not STOCK.exists():
+                    publish_record(STOCK, current)
+                publish_record(SELECTION, {'profile': choice, 'limits_uw': current})
+                print('No saved limits for this boot.')
+                return
+            pending = STATE / 'original.tmp'
+            pending.write_text(json.dumps(current))
+            pending.replace(saved)
+        original = json.loads(saved.read_text())
+        publish_record(STOCK, original)
+        target = original
+        if choice in PRESETS:
+            target = [min(watts * 1_000_000, limit)
+                      for watts, limit in zip(PRESETS[choice], original)]
+        try:
+            write_limits(target)
+            publish_record(SELECTION, {'profile': choice, 'limits_uw': target})
+        except (OSError, RuntimeError):
+            write_limits(current)
+            raise
+        if choice == 'restore':
+            saved.unlink()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('choice', choices=['status', *PRESETS, 'restore', *FAN_MODES],
+                        default='status', nargs='?')
+    choice = parser.parse_args().choice
+    model = Path('/sys/class/dmi/id/product_name').read_text().strip()
+    if model != 'MacBookPro15,4' or not (RAPL / 'name').exists():
+        raise SystemExit('Requires MacBookPro15,4 and Intel package power control.')
+    if choice != 'status' and os.geteuid() != 0:
+        os.execv('/usr/bin/sudo', ['sudo', INSTALLED, choice])
+    if choice in FAN_MODES:
+        select_fan(FAN_MODES[choice])
+        return
+    names = [(RAPL / f'constraint_{i}_name').read_text().strip() for i in (0, 1)]
+    if names != ['long_term', 'short_term'] or (RAPL / 'name').read_text().strip() != 'package-0':
+        raise SystemExit('Unrecognized package power controls.')
+    if choice != 'status':
+        select(choice)
+    long, short = read_limits()
+    print(f'Intel package limits: {long / 1e6:g} W sustained, {short / 1e6:g} W burst.')
+    profile = subprocess.run(['/usr/bin/powerprofilesctl', 'get'], capture_output=True,
+                             text=True, timeout=5)
+    if profile.returncode == 0:
+        print(f'GNOME power mode: {profile.stdout.strip()}.')
+        if profile.stdout.strip() != 'balanced' and choice in PRESETS:
+            print('The custom presets were benchmarked in GNOME Balanced mode.')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,17 @@
+#!/bin/bash
+set -eu
+base=$(cd -- "$(dirname -- "$0")" && pwd)
+case_dir=$(mktemp -d /tmp/thermal-test.XXXXXXXX)
+chmod 700 "$case_dir"
+mkdir -p "$case_dir/runtime" "$case_dir/state" "$case_dir/config" "$case_dir/data" "$case_dir/cache"
+chmod 700 "$case_dir/runtime"
+export XDG_RUNTIME_DIR="$case_dir/runtime" XDG_STATE_HOME="$case_dir/state" XDG_CONFIG_HOME="$case_dir/config" XDG_DATA_HOME="$case_dir/data" XDG_CACHE_HOME="$case_dir/cache"
+unset DBUS_SESSION_BUS_ADDRESS DISPLAY WAYLAND_DISPLAY XAUTHORITY SESSION_MANAGER AT_SPI_BUS_ADDRESS GDMSESSION DESKTOP_AUTOSTART_ID
+export LP_NUM_THREADS=2 LIBGL_ALWAYS_SOFTWARE=1 GDK_BACKEND=wayland XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=GNOME GNOME_SHELL_SESSION_MODE=user
+export GTK_A11Y=none NO_AT_BRIDGE=1
+export THERMAL_TEST_DIR="$case_dir" THERMAL_TEST_SOURCE="$base/.."
+echo "Private session directory: $case_dir"
+timeout -k 5 85 dbus-run-session -- gnome-shell-test-tool --headless --disable-animations --wrap "$base/wayland-shell" "$@" > "$case_dir/shell.log" 2>&1 || { tail -40 "$case_dir/shell.log"; exit 1; }
+if grep -Ei '(Clutter|Gjs|St)-CRITICAL|JS ERROR|Script failed:|Traceback \(most recent call last\)' "$case_dir/shell.log"; then exit 1; fi
+grep -q 'THERMAL-TEST PASS' "$case_dir/shell.log"
+grep -E 'THERMAL-TEST|WAYLAND-PROBE|Test resulted in exception|Error running|JS ERROR' "$case_dir/shell.log"

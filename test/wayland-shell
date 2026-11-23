@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+shell=$1
+shift
+if [ "${THERMAL_TEST_PANEL:-top}" = bottom ]; then
+    [ "$GSETTINGS_BACKEND" = keyfile ]
+    uuid=dash-to-panel@jderose9.github.com
+    ln -s "$HOME/.local/share/gnome-shell/extensions/$uuid" "$XDG_DATA_HOME/gnome-shell/extensions/$uuid"
+    gsettings set org.gnome.shell enabled-extensions "['$uuid','macbook-thermals@ubuntu-thermals.local']"
+fi
+exec "$shell" --no-x11 "$@"

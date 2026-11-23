@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+uuid=macbook-thermals@ubuntu-thermals.local
+share="$HOME/.local/share"
+systemctl --user disable --now macbook-thermals.service
+gnome-extensions disable "$uuid" || true
+cd "$(dirname "$0")"
+if [ -f "/etc/sudoers.d/ubuntu-thermals-$(id -u)" ]; then
+    sudo /usr/bin/python3 -I hardware/manage.py remove
+fi
+for asset in extension/*; do rm -f -- "$share/gnome-shell/extensions/$uuid/${asset##*/}"; done
+for file in monitor.py monitors.py tray.py thermometer.png; do rm -f -- "$share/macbook-thermals-wayland/$file"; done
+rm -f -- "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/macbook-thermals.service" "$share/applications/io.local.MacBookThermals.desktop" "$share/icons/hicolor/48x48/apps/ubuntu-thermals.png"
+systemctl --user daemon-reload

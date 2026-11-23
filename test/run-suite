@@ -1,0 +1,17 @@
+#!/bin/bash
+set -eu
+here=$(cd -- "$(dirname -- "$0")" && pwd)
+case "${1:-top}" in
+    top|bottom) export THERMAL_TEST_PANEL="${1:-top}" ;;
+    *) exit 2 ;;
+esac
+python3 - "$here" <<'PY'
+from pathlib import Path
+from zipfile import ZipFile
+import sys
+d=Path(sys.argv[1])
+with ZipFile(d/'panel.zip','w') as z:
+    for p in sorted((d.parent/'extension').iterdir()):
+        z.write(p,p.name)
+PY
+exec "$here/test-session" --extension "$here/panel.zip" "$here/suite.js"

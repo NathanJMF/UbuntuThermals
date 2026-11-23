@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=MacBook Thermals
+Exec=gapplication launch io.local.MacBookThermals
+Icon=ubuntu-thermals
+Terminal=false
+Categories=System;Monitor;

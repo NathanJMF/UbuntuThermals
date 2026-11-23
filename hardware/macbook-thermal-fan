@@ -1,0 +1,200 @@
+#!/usr/bin/python3 -I
+"""Temperature-based fan profiles for the single-fan MacBookPro15,4."""
+from pathlib import Path
+from threading import Event
+import math
+import os
+import signal
+import socket
+import sys
+import time
+
+ROOT = Path('/run/macbook-fan-profile')
+OWNED = ROOT / 'override'
+READY = ROOT / 'early'
+GATE = Path('/sys/module/macsmc_hwmon/parameters/fan_control')
+MODEL = Path('/sys/class/dmi/id/product_name')
+HWMON = Path('/sys/class/hwmon')
+
+
+def chip(name):
+    for path in HWMON.glob('hwmon*'):
+        if (path/'name').read_text().strip() == name:
+            return path
+    raise RuntimeError(f'Missing {name} fan-control sensor')
+
+
+def write(path, value):
+    path.write_text(f'{value}\n')
+
+
+def release():
+    if OWNED.exists():
+        fan = chip('macsmc_hwmon')
+        write(GATE, 'Y')
+        # On this T2 driver zero selects automatic control; the gate only authorizes writes.
+        try:
+            write(fan/'fan1_target', 0)
+        finally:
+            write(GATE, 'N')
+        if GATE.read_text().strip() != 'N':
+            raise RuntimeError('Could not close the fan control gate')
+        OWNED.unlink()
+
+
+# Temperatures are in degrees Celsius, target speeds in RPM.
+CURVE = ((55, 1200), (60, 2000), (70, 3400), (80, 5400), (87, 7200))
+
+
+def curve_rpm(celsius):
+    if celsius <= CURVE[0][0]:
+        return CURVE[0][1]
+    for (t0, r0), (t1, r1) in zip(CURVE, CURVE[1:]):
+        if celsius <= t1:
+            return round(r0 + (r1-r0)*(celsius-t0)/(t1-t0))
+    return CURVE[-1][1]
+
+
+class Smooth:
+    def __init__(self, fan, advance_celsius=0):
+        self.advance_celsius = advance_celsius
+        labels = {label.read_text().strip(): label.with_name(label.name.replace('_label', '_input'))
+                  for label in fan.glob('temp*_label')}
+        self.other_sensors = [(labels['Synthetic Bottom Skin Temperature (Ts0S)'], 50000),
+                              (labels['Synthetic Top Skin Temperature (Ts1S)'], 50000),
+                              (labels['Battery Temperature (TB0T)'], 44000)]
+        self.filtered = None
+        self.last_sample = None
+
+    def target(self, temp, firmware, rpm, previous, elapsed, now):
+        # Other heat sources are visible to the firmware. Yield if they are warm.
+        for sensor, limit in self.other_sensors:
+            value = int(sensor.read_text())
+            if not 0 < value < 120000:
+                raise RuntimeError('Missing or invalid SMC temperature reading')
+            if value >= limit:
+                self.filtered = None
+                return None
+        # Evaluate the same curve earlier for Smooth+, including takeover and release.
+        celsius = temp / 1000 + self.advance_celsius
+        dt = 0.5 if self.last_sample is None else max(0,now-self.last_sample)
+        self.last_sample = now
+        if self.filtered is None:
+            self.filtered = celsius
+        else:
+            # Three-second low-pass filter. A raw hot reading bypasses the filter.
+            self.filtered += (1 - math.exp(-dt/3)) * (celsius-self.filtered)
+        if celsius >= CURVE[-1][0]:
+            return CURVE[-1][1]
+        desired = curve_rpm(self.filtered)
+        if previous is None:
+            baseline = max(firmware, min(rpm, CURVE[-1][1]))
+            if self.filtered < 60 or desired < baseline + 120:
+                return None
+        else:
+            baseline = previous
+            if self.filtered <= 55 and previous <= CURVE[0][1]+120:
+                return None
+        # Never catch up a long idle interval with a large jump upon takeover.
+        seconds = min(max(elapsed,0), 2)
+        target = round(min(baseline+350*seconds, max(baseline-120*seconds, desired)))
+        if previous is not None and abs(target-previous)<60:
+            return previous
+        return min(CURVE[-1][1],max(CURVE[0][1],target))
+
+
+def run():
+    stopped = Event()
+    signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+    release()
+    if GATE.read_text().strip() != 'N':
+        raise RuntimeError('Another program has enabled manual fan control')
+    try:
+        mode = (ROOT/'requested').read_text().strip()
+    except FileNotFoundError:
+        mode = 'early'
+    if mode not in ('early', 'smooth', 'smooth-plus'):
+        raise RuntimeError('Unrecognized fan profile')
+    ready_file = ROOT / mode
+    fan = chip('macsmc_hwmon')
+    core = chip('coretemp')
+    cpu = next(label.with_name(label.name.replace('_label','_input'))
+               for label in core.glob('temp*_label') if label.read_text().strip() == 'Package id 0')
+    maximum = int((fan/'fan1_max').read_text())
+    minimum = int((fan/'fan1_min').read_text())
+    if (minimum,maximum) != (1200,7200) or (fan/'fan2_input').exists():
+        raise RuntimeError('Unexpected fan hardware')
+    smooth = None if mode == 'early' else Smooth(fan, advance_celsius=3 if mode == 'smooth-plus' else 0)
+    requested = None
+    deadline = None
+    spinup_started = None
+    last_write = time.monotonic() - 0.5
+    ready = False
+    try:
+        while not stopped.is_set():
+            now = time.monotonic()
+            temp = int(cpu.read_text())
+            rpm = int((fan/'fan1_input').read_text())
+            actual = int((fan/'fan1_target').read_text())
+            if not (0 < temp <= 115000 and 0 <= rpm <= maximum*1.25 and 0 <= actual <= maximum+100):
+                raise RuntimeError('Invalid CPU or fan telemetry')
+            # Firmware can park the fan at zero. Once either controller requests
+            # motion, require a tachometer response even if the SMC echoes our target.
+            if rpm == 0 and (requested is not None or actual > 0):
+                if spinup_started is None:
+                    spinup_started = now
+                elif now - spinup_started >= 5:
+                    raise RuntimeError('Fan reported zero RPM for five seconds with a nonzero target')
+            else:
+                spinup_started = None
+            if requested is None and GATE.read_text().strip() != 'N':
+                raise RuntimeError('Another program took control of the fan')
+            confirmed = requested is not None and abs(actual-requested) <= 50
+            if smooth:
+                goal = smooth.target(temp,actual,rpm,requested,now-last_write,now)
+            else:
+                hot = temp >= 73000 or (requested is not None and temp > 65000)
+                goal = maximum if hot else None
+            if goal is None:
+                if requested is not None:
+                    release()
+                requested = deadline = None
+                last_write = now
+            else:
+                if requested is not None:
+                    if confirmed:
+                        deadline = None
+                    elif deadline is None or now >= deadline:
+                        raise RuntimeError('SMC did not confirm the fan target')
+                if goal != requested and (deadline is None or goal == maximum):
+                    if requested is None:
+                        OWNED.touch(mode=0o600)
+                        write(GATE, 'Y')
+                    write(fan/'fan1_target', goal)
+                    requested = goal
+                    last_write = now
+                    deadline = now + 3
+            if not ready and (requested is None or confirmed) and (rpm > 0 or (requested is None and actual == 0)):
+                address = os.environ['NOTIFY_SOCKET']
+                ready_file.touch()
+                with socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM) as sock:
+                    sock.sendto(b'READY=1',address.replace('@','\0',1) if address.startswith('@') else address)
+                ready = True
+            stopped.wait(.5)
+    finally:
+        ready_file.unlink(missing_ok=True)
+        release()
+
+
+if __name__ == '__main__':
+    if MODEL.read_text().strip() != 'MacBookPro15,4':
+        raise SystemExit('Unsupported MacBook model')
+    if sys.argv[1:] == ['run']:
+        run()
+    elif sys.argv[1:] == ['release']:
+        READY.unlink(missing_ok=True)
+        (ROOT/'smooth').unlink(missing_ok=True)
+        (ROOT/'smooth-plus').unlink(missing_ok=True)
+        release()
+    else:
+        raise SystemExit('Expected run or release')

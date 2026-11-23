@@ -1,0 +1,14 @@
+[Unit]
+Description=MacBook Thermals panel monitor
+PartOf=graphical-session.target
+After=graphical-session-pre.target
+
+[Service]
+Type=dbus
+BusName=io.local.MacBookThermals
+ExecStart=/usr/bin/python3 -E %h/.local/share/macbook-thermals-wayland/monitor.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

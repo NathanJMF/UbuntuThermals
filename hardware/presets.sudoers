@@ -1,0 +1,2 @@
+# Fixed preset arguments accepted by the root-owned MacBook helper.
+@UID@ ALL=(root) NOPASSWD: NOSETENV: /usr/local/bin/macbook-power cool, /usr/local/bin/macbook-power mild, /usr/local/bin/macbook-power everyday, /usr/local/bin/macbook-power fast, /usr/local/bin/macbook-power restore, /usr/local/bin/macbook-power fan-auto, /usr/local/bin/macbook-power fan-early, /usr/local/bin/macbook-power fan-smooth, /usr/local/bin/macbook-power fan-smooth-plus

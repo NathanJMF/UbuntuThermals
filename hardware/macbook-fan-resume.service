@@ -1,0 +1,15 @@
+[Unit]
+Description=Resume the selected MacBook fan curve after sleep
+DefaultDependencies=no
+Before=sleep.target
+StopWhenUnneeded=yes
+ConditionPathExists=/sys/module/macsmc_hwmon/parameters/fan_control
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/true
+ExecStop=/usr/local/libexec/macbook-fan-resume
+
+[Install]
+WantedBy=sleep.target
